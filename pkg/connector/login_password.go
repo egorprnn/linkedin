@@ -19,16 +19,24 @@ package connector
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exhttp"
+	"go.mau.fi/util/random"
 	"maunium.net/go/mautrix/bridgev2"
 
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
 )
 
 const FlowIDPassword = "password"
+
+// LoginProxyEnv names the environment variable with the proxy addresses for password logins, separated by commas.
+const LoginProxyEnv = "MAUTRIX_LINKEDIN_LOGIN_PROXY"
 const PasswordLoginStepID = "fi.mau.linkedin.login.credentials"
 const PasswordLoginFallbackStepID = "fi.mau.linkedin.login.browser_fallback"
 const PasswordLoginEmailCodeStepID = "fi.mau.linkedin.login.email_code"
@@ -230,7 +238,12 @@ func (p *PasswordLogin) finishCheckpoint(ctx context.Context, session *linkeding
 func (p *PasswordLogin) newLoginClient() *linkedingo.PasswordLoginClient {
 	httpClient := &http.Client{Transport: p.clientHTTP}
 	if p.clientHTTP == nil {
-		httpClient = p.main.Bridge.GetHTTPClientSettings().Compile()
+		settings := p.main.Bridge.GetHTTPClientSettings()
+		// The requests of a password login can go through a proxy of their own, for servers whose address
+		// LinkedIn refuses on its login page. Everything after the login still connects directly.
+		if httpClient = loginProxyClient(settings, p.user.Log); httpClient == nil {
+			httpClient = settings.Compile()
+		}
 	}
 	client := linkedingo.NewPasswordLoginClient(httpClient)
 	client.LogRedactedLoginResponses = p.main.Config.LogRedactedLoginResponses
@@ -319,4 +332,40 @@ func (p *PasswordLogin) SubmitCookies(ctx context.Context, cookies map[string]st
 		return nil, ErrLoginUnknown
 	}
 	return p.browser.SubmitCookies(ctx, cookies)
+}
+
+// loginProxyClient returns a client that uses one of the proxies in LoginProxyEnv, or nil when none is set.
+// "{session}" in an address is replaced with a random string for each attempt: proxy services that pick the
+// outgoing address themselves keep one address for requests that name the same session, and a login must
+// come from one address. Up to three attempts are made and the first that reaches LinkedIn serves the
+// whole login, so that an address that stopped working doesn't fail it. If none does, the last one is
+// returned and the login reports that LinkedIn couldn't be reached.
+func loginProxyClient(settings exhttp.ClientSettings, log zerolog.Logger) *http.Client {
+	proxies := strings.FieldsFunc(os.Getenv(LoginProxyEnv), func(r rune) bool { return r == ',' || r == ' ' })
+	if len(proxies) == 0 {
+		return nil
+	}
+	const attempts = 3
+	first := rand.IntN(len(proxies))
+	var client *http.Client
+	for i := range attempts {
+		proxy := strings.ReplaceAll(proxies[(first+i)%len(proxies)], "{session}", random.String(12))
+		proxied, err := settings.WithProxy(proxy)
+		if err != nil {
+			log.Error().Str("env", LoginProxyEnv).Msg("Ignoring an invalid login proxy address")
+			continue
+		}
+		client = proxied.Compile()
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodHead, "https://www.linkedin.com/robots.txt", nil)
+		req.Header.Set("User-Agent", linkedingo.UserAgent)
+		resp, err := client.Do(req)
+		cancel()
+		if err == nil {
+			_ = resp.Body.Close()
+			return client
+		}
+		log.Warn().Int("attempt", i+1).Msg("Login proxy didn't reach LinkedIn, trying again")
+	}
+	return client
 }
